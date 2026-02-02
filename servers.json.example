@@ -1,0 +1,12 @@
+{
+  "active_server": "server-key-name",
+  "servers": {
+    "server-key-name": {
+      "name": "Server Display Name",
+      "server_ip": "SERVER_IP",
+      "server_port": 28017,
+      "player_id": "YOUR_STEAM_ID",
+      "player_token": "YOUR_PLAYER_TOKEN"
+    }
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "fcm_credentials": {
+    "gcm": {
+      "androidId": "YOUR_ANDROID_ID",
+      "securityToken": "YOUR_SECURITY_TOKEN"
+    },
+    "fcm": {
+      "token": "YOUR_FCM_TOKEN"
+    }
+  },
+  "expo_push_token": "YOUR_EXPO_PUSH_TOKEN",
+  "rustplus_auth_token": "YOUR_AUTH_TOKEN"
+}

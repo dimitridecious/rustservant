@@ -1,0 +1,15 @@
+{
+  "name": "rustservant-pairing",
+  "version": "1.0.0",
+  "description": "Rust+ automatic pairing capture for RustServant",
+  "main": "capture_pairing.js",
+  "scripts": {
+    "pair": "node capture_pairing.js"
+  },
+  "dependencies": {
+    "json5": "^2.2.3",
+    "@liamcottle/rustplus.js": "^2.5.0"
+  },
+  "author": "",
+  "license": "MIT"
+}

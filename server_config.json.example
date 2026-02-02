@@ -1,0 +1,6 @@
+{
+  "server_ip": "YOUR_SERVER_IP",
+  "server_port": 28017,
+  "player_id": "YOUR_STEAM_ID",
+  "player_token": "YOUR_PLAYER_TOKEN"
+}

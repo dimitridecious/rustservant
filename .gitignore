@@ -1,0 +1,7 @@
+/target
+node_modules/
+*.config.json
+discord_config.json
+server_config.json
+servers.json
+PLAN.md
