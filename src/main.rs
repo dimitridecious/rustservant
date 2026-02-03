@@ -3,6 +3,8 @@ mod rustplus {
 }
 
 mod discord;
+mod helpers;
+mod items;
 
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
@@ -12,9 +14,10 @@ use prost::Message as ProstMessage;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
+use std::collections::HashMap;
 use tokio::sync::RwLock;
 
-use rustplus::{AppRequest, AppMessage, AppEmpty, AppSendMessage, AppTime, AppInfo};
+use rustplus::{AppRequest, AppMessage, AppEmpty, AppSendMessage, AppTime, AppInfo, AppMapMarkers, AppMarkerType, AppMap};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ServerConfig {
@@ -141,10 +144,25 @@ impl DiscordConfig {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct ServerState {
     time: Option<AppTime>,
     info: Option<AppInfo>,
+    markers: Option<AppMapMarkers>,
+    map: Option<AppMap>,
+    marker_first_seen: HashMap<u32, u32>,
+}
+
+impl Default for ServerState {
+    fn default() -> Self {
+        Self {
+            time: None,
+            info: None,
+            markers: None,
+            map: None,
+            marker_first_seen: HashMap::new(),
+        }
+    }
 }
 
 impl ServerState {
@@ -515,16 +533,29 @@ async fn run_rustplus_connection(
                 let mut buf = Vec::new();
                 info_request.encode(&mut buf).unwrap();
                 let _ = write_guard.send(Message::Binary(buf)).await;
+
+                let map_request = AppRequest {
+                    seq: 3,
+                    player_id,
+                    player_token,
+                    entity_id: 0,
+                    get_map: Some(AppEmpty {}),
+                    ..Default::default()
+                };
+                let mut buf = Vec::new();
+                map_request.encode(&mut buf).unwrap();
+                let _ = write_guard.send(Message::Binary(buf)).await;
             }
 
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
             println!("Monitoring team chat for commands...");
-            println!("Commands: !time, !night, !day, !info");
+            println!("Commands: !time, !night, !day, !info, !showevents, !debugmarkers");
             println!("Press Ctrl+C to exit.\n");
 
             let mut read = read;
             let mut seq_counter = 100u32;
+            let last_markers_request_seq: Arc<RwLock<Option<(u32, bool, bool)>>> = Arc::new(RwLock::new(None)); // (seq, is_show_events, is_debug)
 
             loop {
                 tokio::select! {
@@ -561,6 +592,179 @@ async fn run_rustplus_connection(
                                         println!("Updated server info");
                                     }
 
+                                    if let Some(map) = response.map {
+                                        let monument_count = map.monuments.len();
+                                        state_guard.map = Some(map);
+                                        println!("Updated map data ({} monuments)", monument_count);
+                                    }
+
+                                    if let Some(markers) = response.map_markers {
+                                        println!("Received map markers response");
+
+                                        // Check if this was from our test command
+                                        let request_info = {
+                                            let last_seq = last_markers_request_seq.read().await;
+                                            last_seq.and_then(|(seq, is_show, is_debug)| {
+                                                if seq == response.seq {
+                                                    Some((is_show, is_debug))
+                                                } else {
+                                                    None
+                                                }
+                                            })
+                                        };
+
+                                        if let Some((is_show_events, is_debug)) = request_info {
+                                            let result = if is_debug {
+                                                let non_vending: Vec<_> = markers.markers.iter()
+                                                    .filter(|m| m.r#type() != AppMarkerType::VendingMachine)
+                                                    .collect();
+
+                                                let mut debug_info = format!("Marker Debug ({} non-vending):\n\n", non_vending.len());
+
+                                                for (i, &marker) in non_vending.iter().enumerate().take(15) {
+                                                    debug_info.push_str(&format!("{}. Type: {:?}\n", i + 1, marker.r#type()));
+                                                    debug_info.push_str(&format!("   Name: '{}'\n", marker.name));
+                                                    debug_info.push_str(&format!("   Coords: ({:.1}, {:.1})\n", marker.x, marker.y));
+                                                    debug_info.push_str(&format!("   Radius: {:.1}\n", marker.radius));
+                                                    debug_info.push_str(&format!("   ID: {}\n\n", marker.id));
+                                                }
+
+                                                if non_vending.len() > 15 {
+                                                    debug_info.push_str(&format!("...and {} more", non_vending.len() - 15));
+                                                }
+
+                                                debug_info
+                                            } else if is_show_events {
+                                                // Show detailed event list with locations
+                                                let map_size = state_guard.info.as_ref().map(|i| i.map_size).unwrap_or(4000);
+                                                let mut events = Vec::new();
+
+                                                for marker in &markers.markers {
+                                                    let event_name = match marker.r#type() {
+                                                        AppMarkerType::PatrolHelicopter => Some("Patrol Heli"),
+                                                        AppMarkerType::CargoShip => Some("Cargo Ship"),
+                                                        AppMarkerType::Crate => Some("Locked Crate"),
+                                                        AppMarkerType::Ch47 => Some("Chinook"),
+                                                        AppMarkerType::TravelingVendor => Some("Traveling Vendor"),
+                                                        AppMarkerType::Explosion => Some("Explosion/Crash Site"),
+                                                        _ => None,
+                                                    };
+
+                                                    if let Some(name) = event_name {
+                                                        // Check if coordinates are within map bounds
+                                                        let is_valid = marker.x >= 0.0
+                                                            && marker.x <= map_size as f32
+                                                            && marker.y >= 0.0
+                                                            && marker.y <= map_size as f32;
+
+                                                        let location_str = if is_valid {
+                                                            let grid = helpers::coords_to_grid(marker.x, marker.y, map_size);
+                                                            let region = helpers::get_map_region(marker.x, marker.y, map_size);
+                                                            format!("{} at {} ({}) - coords: ({:.0}, {:.0})",
+                                                                name, grid, region, marker.x, marker.y)
+                                                        } else {
+                                                            // Determine general direction for out-of-bounds
+                                                            let x_dir = if marker.x < 0.0 {
+                                                                "left"
+                                                            } else if marker.x > map_size as f32 {
+                                                                "right"
+                                                            } else {
+                                                                ""
+                                                            };
+
+                                                            let y_dir = if marker.y < 0.0 {
+                                                                "bottom"
+                                                            } else if marker.y > map_size as f32 {
+                                                                "top"
+                                                            } else {
+                                                                ""
+                                                            };
+
+                                                            let direction = match (y_dir, x_dir) {
+                                                                ("", "") => "outside grids".to_string(),
+                                                                ("", x) => format!("outside grids - {}", x),
+                                                                (y, "") => format!("outside grids - {}", y),
+                                                                (y, x) => format!("outside grids - {} {}", y, x),
+                                                            };
+
+                                                            format!("{} ({})", name, direction)
+                                                        };
+
+                                                        events.push(location_str);
+                                                    }
+                                                }
+
+                                                if events.is_empty() {
+                                                    "No active events right now".to_string()
+                                                } else {
+                                                    format!("Active Events ({}):\n{}", events.len(), events.join("\n"))
+                                                }
+                                            } else {
+                                                // Show summary counts (old !getmarkers behavior)
+                                                let marker_count = markers.markers.len();
+                                                let mut result = format!("Map Markers (total: {}):\n", marker_count);
+
+                                                let mut heli_count = 0;
+                                                let mut cargo_count = 0;
+                                                let mut crate_count = 0;
+                                                let mut chinook_count = 0;
+                                                let mut vendor_count = 0;
+                                                let mut vending_count = 0;
+                                                let mut other_count = 0;
+
+                                                for marker in &markers.markers {
+                                                    match marker.r#type() {
+                                                        AppMarkerType::PatrolHelicopter => heli_count += 1,
+                                                        AppMarkerType::CargoShip => cargo_count += 1,
+                                                        AppMarkerType::Crate => crate_count += 1,
+                                                        AppMarkerType::Ch47 => chinook_count += 1,
+                                                        AppMarkerType::TravelingVendor => vendor_count += 1,
+                                                        AppMarkerType::VendingMachine => vending_count += 1,
+                                                        _ => other_count += 1,
+                                                    }
+                                                }
+
+                                                result.push_str(&format!("Patrol Heli: {}\n", heli_count));
+                                                result.push_str(&format!("Cargo Ship: {}\n", cargo_count));
+                                                result.push_str(&format!("Locked Crates: {}\n", crate_count));
+                                                result.push_str(&format!("Chinook: {}\n", chinook_count));
+                                                result.push_str(&format!("Traveling Vendor: {}\n", vendor_count));
+                                                result.push_str(&format!("Vending Machines: {}\n", vending_count));
+                                                result.push_str(&format!("Other: {}", other_count));
+                                                result
+                                            };
+
+                                            // Send response to team chat
+                                            seq_counter += 1;
+                                            let send_request = AppRequest {
+                                                seq: seq_counter,
+                                                player_id,
+                                                player_token,
+                                                entity_id: 0,
+                                                send_team_message: Some(AppSendMessage {
+                                                    message: result.clone(),
+                                                }),
+                                                ..Default::default()
+                                            };
+
+                                            let mut buf = Vec::new();
+                                            if send_request.encode(&mut buf).is_ok() {
+                                                let mut write_guard = write.lock().await;
+                                                if let Err(e) = write_guard.send(Message::Binary(buf)).await {
+                                                    eprintln!("Failed to send: {}", e);
+                                                } else {
+                                                    println!("[Sent] {}", result);
+                                                }
+                                            }
+
+                                            // Clear the pending request
+                                            *last_markers_request_seq.write().await = None;
+                                        }
+
+                                        // Store markers in state
+                                        state_guard.markers = Some(markers);
+                                    }
+
                                     if let Some(error) = response.error {
                                         eprintln!("API Error: {}", error.error);
 
@@ -589,6 +793,36 @@ async fn run_rustplus_connection(
 
                                             if message_text.starts_with('!') {
                                                 let command = message_text.trim().to_lowercase();
+
+                                                // Handle marker commands separately (async request)
+                                                if command == "!showevents" || command == "!getmarkers" || command == "!debugmarkers" {
+                                                    let is_show_events = command == "!showevents";
+                                                    let is_debug = command == "!debugmarkers";
+                                                    seq_counter += 1;
+                                                    let markers_seq = seq_counter;
+                                                    *last_markers_request_seq.write().await = Some((markers_seq, is_show_events, is_debug));
+
+                                                    let markers_request = AppRequest {
+                                                        seq: markers_seq,
+                                                        player_id,
+                                                        player_token,
+                                                        entity_id: 0,
+                                                        get_map_markers: Some(AppEmpty {}),
+                                                        ..Default::default()
+                                                    };
+
+                                                    let mut buf = Vec::new();
+                                                    if markers_request.encode(&mut buf).is_ok() {
+                                                        let mut write_guard = write.lock().await;
+                                                        if let Err(e) = write_guard.send(Message::Binary(buf)).await {
+                                                            eprintln!("Failed to send markers request: {}", e);
+                                                        } else {
+                                                            println!("[Sent] getMapMarkers request (seq: {})", markers_seq);
+                                                        }
+                                                    }
+                                                    continue; // Skip normal response handling
+                                                }
+
                                                 let state_guard = state.read().await;
 
                                                 let response_text = match command.as_str() {
@@ -596,7 +830,57 @@ async fn run_rustplus_connection(
                                                     "!night" => state_guard.calculate_time_until_night(),
                                                     "!day" => state_guard.calculate_time_until_day(),
                                                     "!info" => state_guard.get_server_info(),
-                                                    _ => Some(format!("Unknown command. Try: !time, !night, !day, !info")),
+                                                    "!mapdebug" => {
+                                                        if let (Some(map), Some(info)) = (&state_guard.map, &state_guard.info) {
+                                                            Some(format!(
+                                                                "Map Debug Info:\nMap Size: {}m\nOcean Margin: {}\nMonuments: {}\nMap Dimensions: {}x{}\n\nFirst monument:\n{} at ({:.1}, {:.1})",
+                                                                info.map_size,
+                                                                map.ocean_margin,
+                                                                map.monuments.len(),
+                                                                map.width,
+                                                                map.height,
+                                                                map.monuments.get(0).map(|m| m.token.as_str()).unwrap_or("none"),
+                                                                map.monuments.get(0).map(|m| m.x).unwrap_or(0.0),
+                                                                map.monuments.get(0).map(|m| m.y).unwrap_or(0.0)
+                                                            ))
+                                                        } else {
+                                                            Some("Map data not loaded yet".to_string())
+                                                        }
+                                                    },
+                                                    "!testmonuments" => {
+                                                        if let (Some(map), Some(info)) = (&state_guard.map, &state_guard.info) {
+                                                            // Skip train tunnels - filter them out
+                                                            let mut non_tunnel_monuments: Vec<_> = map.monuments.iter()
+                                                                .filter(|m| !m.token.contains("train_tunnel"))
+                                                                .collect();
+
+                                                            let total = non_tunnel_monuments.len();
+
+                                                            // Rotate starting position based on timestamp for variety
+                                                            let seed = std::time::SystemTime::now()
+                                                                .duration_since(std::time::UNIX_EPOCH)
+                                                                .unwrap()
+                                                                .as_secs() as usize;
+
+                                                            let offset = seed % total;
+                                                            non_tunnel_monuments.rotate_left(offset);
+
+                                                            let display_count = total.min(10);
+                                                            let mut result = format!("Monument Grid Test (showing {} of {}):\n",
+                                                                display_count, total);
+
+                                                            for (i, monument) in non_tunnel_monuments.iter().take(display_count).enumerate() {
+                                                                let grid = helpers::coords_to_grid(monument.x, monument.y, info.map_size);
+                                                                let region = helpers::get_map_region(monument.x, monument.y, info.map_size);
+                                                                result.push_str(&format!("{}. {} at {} ({}) - coords: ({:.0}, {:.0})\n",
+                                                                    i + 1, monument.token, grid, region, monument.x, monument.y));
+                                                            }
+                                                            Some(result)
+                                                        } else {
+                                                            Some("Map data not loaded yet".to_string())
+                                                        }
+                                                    },
+                                                    _ => Some(format!("Unknown command. Try: !time, !night, !day, !info, !showevents")),
                                                 };
 
                                                 drop(state_guard);

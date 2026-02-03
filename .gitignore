@@ -4,4 +4,8 @@ node_modules/
 discord_config.json
 server_config.json
 servers.json
+
+# Markdown files (except README)
 PLAN.md
+SETUP_SENSITIVE.md
+phase1.md
