@@ -1,146 +1,113 @@
 # RustServant
 
-A Discord bot that integrates with Rust game servers via the RustPlus API for server monitoring and management.
+**Work in Progress** - A Rust+ API integration tool that bridges Rust game servers with Discord for automated monitoring and management.
 
-## Prerequisites
+## Status
 
-- **Rust** (latest stable) - [Install](https://rustup.rs/)
-- **Node.js** (v16+) and npm - [Install](https://nodejs.org/)
-- **Discord Bot Token** - [Create a bot](https://discord.com/developers/applications)
-- **Rust+ Companion App** credentials
+Currently in active development. The bot is not yet ready for general use.
 
-## Installation
+**What's Working:**
+- Rust+ WebSocket connection and authentication
+- Multi-server configuration and switching
+- Discord bot integration with slash commands
+- Automatic server pairing via FCM notifications
+- Server info commands (time, day/night cycles, server details)
+- Map data and monument tracking
+- Grid coordinate system (150m cells, supports AA-AB+ notation)
+- Event marker fetching and display
 
-### 1. Clone the repository
+**What's In Progress:**
+- Event location commands (!where heli, !where cargo, etc.)
+- Vending machine search by item name
+- Distinguishing Bradley vs Heli crash sites
 
-```bash
-git clone git@github.com:dimitridecious/rustservant.git
-cd rustservant
+## Goals
+
+Build a comprehensive Rust server companion that provides:
+
+**Event Tracking**
+- Locate Patrol Helicopter, Cargo Ship, Chinook, Locked Crates
+- Track Traveling Vendor and Bradley APC
+- Real-time event notifications
+
+**Item & Economy**
+- Search vending machines across the map
+- Find items with pricing and stock levels
+- Compare prices between vendors
+
+**Team Management**
+- Monitor team member locations and status
+- Track who's online, alive, or dead
+- View team positions on the map
+
+**Smart Devices**
+- Remote control switches, doors, turrets
+- Monitor storage contents
+- Manage alarms and automation
+
+## Expected Output Examples
+
+**Event Location:**
+```
+!showevents
+
+Active Events (3):
+Cargo Ship at Y0 (top right) - coords: (3745, 3706)
+Traveling Vendor at G15 (left) - coords: (929, 1534)
+Patrol Heli at R16 (center) - coords: (2584, 1345)
 ```
 
-### 2. Install Rust dependencies
+**Server Info:**
+```
+!info
 
-```bash
-cargo build
+Rust Server US West | 45/200 players | Map: 4000m | Seed: 1234567
 ```
 
-### 3. Install Node.js dependencies (for pairing capture)
+**Grid System:**
+Standard Rust grid notation (A-Z, then AA-AB+) with 150m cells:
+- A0 = top left corner
+- Z25 = bottom right (on 4000m map)
 
-```bash
-npm install
+## Current Commands
+
+**In-Game (Team Chat):**
+- `!time` - Current server time
+- `!night` - Time until nightfall
+- `!day` - Time until daytime
+- `!info` - Server information
+- `!showevents` - List active events (development/testing)
+- `!getmarkers` - Marker summary (development/testing)
+- `!debugmarkers` - Detailed marker debug (development/testing)
+
+**Discord:**
+- `/servers` - List configured servers
+- `/switch <server>` - Switch active server
+- `/current` - Show current server
+- `/remove <server>` - Remove server
+
+## Technology Stack
+
+- **Language:** Rust (2024 edition)
+- **Protocol:** Protobuf via prost
+- **WebSocket:** tokio-tungstenite
+- **Discord:** serenity 0.12
+- **Runtime:** tokio async
+
+## Architecture
+
 ```
-
-## Configuration
-
-### 1. Discord Configuration
-
-Create `discord_config.json` from the example:
-
-```bash
-cp discord_config.json.example discord_config.json
+RustServant
+├── Rust+ WebSocket Client
+│   ├── Map marker tracking
+│   ├── Team chat monitoring
+│   └── Command processor
+├── Discord Bot
+│   ├── Slash commands
+│   └── Server management
+└── Automatic Pairing
+    └── FCM notification capture
 ```
-
-Edit `discord_config.json` with your values:
-- `bot_token`: Your Discord bot token
-- `application_id`: Your Discord application ID
-- `guild_id`: Your Discord server (guild) ID
-
-### 2. Server Configuration
-
-Create `server_config.json` from the example:
-
-```bash
-cp server_config.json.example server_config.json
-```
-
-Edit `server_config.json` with your values:
-- `server_ip`: Your Rust server IP address
-- `server_port`: Your Rust server port (default: 28017)
-- `player_id`: Your Steam ID
-- `player_token`: Your player token from Rust+
-
-### 3. Multiple Servers (Optional)
-
-Create `servers.json` from the example:
-
-```bash
-cp servers.json.example servers.json
-```
-
-Configure multiple servers with their respective credentials.
-
-### 4. RustPlus Configuration
-
-Create `rustplus.config.json` from the example:
-
-```bash
-cp rustplus.config.json.example rustplus.config.json
-```
-
-This file contains FCM credentials and authentication tokens for the RustPlus API.
-
-## Getting Rust+ Credentials
-
-To get your player token and other credentials:
-
-1. Run the pairing capture script:
-   ```bash
-   npm run pair
-   ```
-
-2. Pair with your server using the Rust+ companion app on your phone
-
-3. The script will capture and display the pairing credentials
-
-4. Copy the credentials to your config files
-
-## Running the Bot
-
-### Development
-
-```bash
-cargo run
-```
-
-### Production
-
-```bash
-cargo build --release
-./target/release/rustservant
-```
-
-## Project Structure
-
-- `src/` - Rust source code
-  - `main.rs` - Main entry point
-  - `discord/` - Discord bot integration
-- `capture_pairing.js` - Node.js script for capturing Rust+ pairing
-- `rustplus.proto` - Protocol buffer definitions for RustPlus API
-- `*.json.example` - Example configuration files
-
-## Important Security Notes
-
-- **Never commit** your actual config files (`*.json`) to git
-- All sensitive configuration files are excluded via `.gitignore`
-- Only commit the `.example` files as templates
-- Keep your Discord bot token and player tokens secure
-
-## Troubleshooting
-
-### Bot doesn't connect to Discord
-- Verify your bot token in `discord_config.json`
-- Check that the bot has proper permissions in your Discord server
-- Ensure the application_id and guild_id are correct
-
-### Can't connect to Rust server
-- Verify server IP and port are correct
-- Check that your player_id and player_token are valid
-- Ensure the Rust server has Rust+ enabled
-
-### Pairing capture not working
-- Make sure Node.js dependencies are installed (`npm install`)
-- Check that you're using the correct server details
-- Try re-pairing with the Rust+ app
 
 ## License
 
