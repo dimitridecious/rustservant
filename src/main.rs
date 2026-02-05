@@ -1,3 +1,4 @@
+#[allow(dead_code)]
 mod rustplus {
     include!(concat!(env!("OUT_DIR"), "/rustplus.rs"));
 }
@@ -14,10 +15,15 @@ use prost::Message as ProstMessage;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
-use std::collections::HashMap;
 use tokio::sync::RwLock;
 
 use rustplus::{AppRequest, AppMessage, AppEmpty, AppSendMessage, AppTime, AppInfo, AppMapMarkers, AppMarkerType, AppMap};
+
+enum ReconnectAction {
+    SwitchServer,  // User requested server switch
+    Retry,         // Connection lost, should retry
+    Stop,          // Fatal error, stop completely
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ServerConfig {
@@ -51,12 +57,7 @@ impl ServersConfig {
         let config_path = "servers.json";
 
         if !Path::new(config_path).exists() {
-            return Err(format!(
-                "Config file not found: {}\n\
-                Please run: node capture_pairing.js\n\
-                Then pair with your server in-game.",
-                config_path
-            ).into());
+            return Err("No servers configured yet".into());
         }
 
         let config_data = fs::read_to_string(config_path)?;
@@ -87,14 +88,6 @@ impl ServersConfig {
         Ok(())
     }
 
-    fn add_server(&mut self, server_id: String, config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
-        self.servers.insert(server_id.clone(), config);
-        if self.servers.len() == 1 {
-            self.active_server = server_id;
-        }
-        self.save()?;
-        Ok(())
-    }
 
     fn remove_server(&mut self, server_id: &str) -> Result<(), Box<dyn std::error::Error>> {
         if server_id == self.active_server {
@@ -150,7 +143,6 @@ struct ServerState {
     info: Option<AppInfo>,
     markers: Option<AppMapMarkers>,
     map: Option<AppMap>,
-    marker_first_seen: HashMap<u32, u32>,
 }
 
 impl Default for ServerState {
@@ -160,7 +152,6 @@ impl Default for ServerState {
             info: None,
             markers: None,
             map: None,
-            marker_first_seen: HashMap::new(),
         }
     }
 }
@@ -245,114 +236,87 @@ impl ServerState {
     fn get_current_time_info(&self) -> Option<String> {
         let time = self.time.as_ref()?;
         let current = time.time;
+        let sunrise = time.sunrise;
+        let sunset = time.sunset;
+        let day_length_minutes = time.day_length_minutes;
 
         let hours = current.floor() as u32;
         let minutes = ((current - hours as f32) * 60.0) as u32;
 
-        let period = if current >= time.sunrise && current < time.sunset {
-            "Day"
+        let is_daytime = current >= sunrise && current < sunset;
+
+        // Calculate time until next cycle
+        const NIGHT_LENGTH_MINUTES: f32 = 15.0;
+        let actual_day_minutes = day_length_minutes - NIGHT_LENGTH_MINUTES;
+        let daytime_hours = sunset - sunrise;
+        let nighttime_hours = 24.0 - daytime_hours;
+
+        let real_minutes_until = if is_daytime {
+            // Time until night
+            let hours_until_sunset = sunset - current;
+            hours_until_sunset * (actual_day_minutes / daytime_hours)
         } else {
-            "Night"
+            // Time until day
+            let hours_until_sunrise = if current >= sunset {
+                (24.0 - current) + sunrise
+            } else {
+                sunrise - current
+            };
+            hours_until_sunrise * (NIGHT_LENGTH_MINUTES / nighttime_hours)
         };
 
+        let mins = real_minutes_until.floor() as u32;
+        let secs = ((real_minutes_until - mins as f32) * 60.0) as u32;
+
+        let next_cycle = if is_daytime { "Night" } else { "Day" };
+
+        // Format: "14:23 (Day) - Night in 42m 34s" = ~30 chars
         Some(format!(
-            "Current time: {:02}:{:02} ({})",
-            hours, minutes, period
+            "{:02}:{:02} ({}) - {} in {}m {}s",
+            hours, minutes,
+            if is_daytime { "Day" } else { "Night" },
+            next_cycle, mins, secs
         ))
     }
 
     fn get_server_info(&self) -> Option<String> {
         let info = self.info.as_ref()?;
         Some(format!(
-            "{} | {}/{} players | Map: {}m | Seed: {}",
-            info.name,
-            info.players,
-            info.max_players,
-            info.map_size,
-            info.seed
+            "{}",
+            info.name
         ))
     }
-}
 
-async fn start_pairing_listener() -> Option<tokio::process::Child> {
-    use tokio::process::Command;
+    fn get_population_info(&self) -> Option<String> {
+        let info = self.info.as_ref()?;
 
-    let script_path = "capture_pairing.js";
+        let queue_info = if info.queued_players > 0 {
+            format!(" ({} in queue)", info.queued_players)
+        } else {
+            String::new()
+        };
 
-    if !Path::new(script_path).exists() {
-        eprintln!("Warning: {} not found. Automatic pairing disabled.", script_path);
-        return None;
-    }
-
-    println!("Starting automatic pairing listener...");
-    println!("Running: node {}", script_path);
-
-    let current_dir = std::env::current_dir().unwrap_or_default();
-    println!("Working directory: {}", current_dir.display());
-
-    match Command::new("node")
-        .arg(script_path)
-        .current_dir(&current_dir)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-    {
-        Ok(mut child) => {
-            println!("Process spawned with PID: {:?}", child.id());
-
-            let stdout = child.stdout.take();
-            let stderr = child.stderr.take();
-
-            if let Some(stdout) = stdout {
-                tokio::spawn(async move {
-                    use tokio::io::{AsyncBufReadExt, BufReader};
-                    let reader = BufReader::new(stdout);
-                    let mut lines = reader.lines();
-
-                    while let Ok(Some(line)) = lines.next_line().await {
-                        println!("[Pairing] {}", line);
-                    }
-                });
-            }
-
-            if let Some(stderr) = stderr {
-                tokio::spawn(async move {
-                    use tokio::io::{AsyncBufReadExt, BufReader};
-                    let reader = BufReader::new(stderr);
-                    let mut lines = reader.lines();
-
-                    while let Ok(Some(line)) = lines.next_line().await {
-                        eprintln!("[Pairing] {}", line);
-                    }
-                });
-            }
-
-            println!("Pairing listener started successfully\n");
-            Some(child)
-        }
-        Err(e) => {
-            eprintln!("Warning: Failed to start pairing listener: {}", e);
-            eprintln!("Make sure Node.js is installed. Automatic pairing disabled.\n");
-            None
-        }
+        Some(format!(
+            "Players: {}/{}{}",
+            info.players,
+            info.max_players,
+            queue_info
+        ))
     }
 }
 
 #[tokio::main]
 async fn main() {
-    println!("=== RustServant ===");
-    println!("Starting up...\n");
-
-    let mut pairing_script = start_pairing_listener().await;
+    println!("=== RustServant ===\n");
 
     let discord_config = match DiscordConfig::load() {
         Ok(cfg) => {
-            println!("Starting Discord bot...");
+            println!("Discord bot enabled");
             Some(cfg)
         }
         Err(e) => {
-            eprintln!("Warning: Discord bot disabled: {}", e);
-            eprintln!("Continuing with Rust+ only...\n");
+            eprintln!("Discord bot disabled: {}", e);
+            eprintln!("Continuing with Rust+ only\n");
             None
         }
     };
@@ -365,12 +329,11 @@ async fn main() {
                         eprintln!("Discord bot error: {}", e);
                     }
                 });
-                println!("Discord bot started successfully\n");
                 Some(command_rx)
             }
             Err(e) => {
                 eprintln!("Failed to start Discord bot: {}", e);
-                eprintln!("Continuing with Rust+ only...\n");
+                eprintln!("Continuing with Rust+ only\n");
                 None
             }
         }
@@ -378,33 +341,30 @@ async fn main() {
         None
     };
 
+    let mut reconnect_attempts = 0;
+    let max_reconnect_attempts = 5;
+
     loop {
         let servers_config = match ServersConfig::load() {
             Ok(cfg) => cfg,
             Err(e) => {
-                eprintln!("Failed to load configuration:");
-                eprintln!("  {}\n", e);
-                eprintln!("To get started:");
-                eprintln!("  1. Run: node capture_pairing.js");
-                eprintln!("  2. In Rust game: ESC -> Rust+ -> Pair with Server");
-                eprintln!("  3. Run this program again");
+                eprintln!("Configuration error: {}", e);
+                eprintln!("Use Discord command /pair to add a server\n");
                 return;
             }
         };
 
         let config = match servers_config.get_active_server() {
             Ok(cfg) => {
-                println!("Loaded server configuration");
-                println!("  Active Server: {}", servers_config.active_server);
-                println!("  Name: {}", cfg.name);
-                println!("  Address: {}:{}", cfg.server_ip, cfg.server_port);
-                println!("  Player: {}", cfg.player_id);
-                println!();
+                if reconnect_attempts == 0 {
+                    println!("Connecting to: {} ({}:{})\n", cfg.name, cfg.server_ip, cfg.server_port);
+                } else {
+                    println!("Reconnecting to: {} (attempt {}/{})\n", cfg.name, reconnect_attempts + 1, max_reconnect_attempts);
+                }
                 cfg
             }
             Err(e) => {
-                eprintln!("Failed to load active server:");
-                eprintln!("  {}", e);
+                eprintln!("Failed to load active server: {}", e);
                 return;
             }
         };
@@ -425,24 +385,36 @@ async fn main() {
             }
         };
 
-        let should_reconnect = run_rustplus_connection(
+        let reconnect_result = run_rustplus_connection(
             config,
             player_id,
             player_token,
             &mut discord_command_rx,
         ).await;
 
-        if !should_reconnect {
-            break;
+        match reconnect_result {
+            ReconnectAction::SwitchServer => {
+                println!("\nSwitching servers...\n");
+                reconnect_attempts = 0;
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            }
+            ReconnectAction::Retry => {
+                reconnect_attempts += 1;
+                if reconnect_attempts >= max_reconnect_attempts {
+                    eprintln!("\nMax reconnection attempts ({}) reached. Giving up.", max_reconnect_attempts);
+                    eprintln!("Check your connection or use /pair to re-authenticate\n");
+                    break;
+                }
+
+                // Exponential backoff: 2s, 4s, 8s, 16s, 32s
+                let delay = 2u64.pow(reconnect_attempts as u32);
+                println!("Retrying in {} seconds...\n", delay);
+                tokio::time::sleep(tokio::time::Duration::from_secs(delay)).await;
+            }
+            ReconnectAction::Stop => {
+                break;
+            }
         }
-
-        println!("\nReconnecting to new server...\n");
-        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-    }
-
-    if let Some(mut child) = pairing_script {
-        println!("\nStopping pairing listener...");
-        let _ = child.kill().await;
     }
 
     println!("Shutdown complete.");
@@ -453,14 +425,13 @@ async fn run_rustplus_connection(
     player_id: u64,
     player_token: i32,
     discord_command_rx: &mut Option<tokio::sync::mpsc::UnboundedReceiver<discord::DiscordCommand>>,
-) -> bool {
+) -> ReconnectAction {
 
     let url = format!("ws://{}:{}/", config.server_ip, config.server_port);
-    println!("Attempting to connect to: {}", url);
 
     match connect_async(&url).await {
         Ok((ws_stream, _)) => {
-            println!("Connected successfully!");
+            println!("Connected to Rust+ API\n");
 
             let (write, read) = ws_stream.split();
             let write = Arc::new(tokio::sync::Mutex::new(write));
@@ -549,9 +520,7 @@ async fn run_rustplus_connection(
 
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
-            println!("Monitoring team chat for commands...");
-            println!("Commands: !time, !night, !day, !info, !showevents, !debugmarkers");
-            println!("Press Ctrl+C to exit.\n");
+            println!("Ready! Type !help in team chat for commands\n");
 
             let mut read = read;
             let mut seq_counter = 100u32;
@@ -566,9 +535,20 @@ async fn run_rustplus_connection(
                         }
                     } => {
                         match discord_cmd {
-                            discord::DiscordCommand::SwitchServer(_) => {
-                                println!("Received server switch command from Discord");
-                                return true;
+                            discord::DiscordCommand::SwitchServer(server_id) => {
+                                println!("Switching to server: {}", server_id);
+                                return ReconnectAction::SwitchServer;
+                            }
+                            discord::DiscordCommand::RemoveServer(server_id) => {
+                                println!("Server removed: {}", server_id);
+                                // Discord already handled the removal, no action needed here
+                            }
+                            discord::DiscordCommand::StartPairing => {
+                                // Pairing is handled in Discord interaction response
+                                // The actual process runs independently
+                            }
+                            discord::DiscordCommand::Help => {
+                                // Help is handled in Discord interaction response
                             }
                             _ => {}
                         }
@@ -584,23 +564,19 @@ async fn run_rustplus_connection(
 
                                     if let Some(time) = response.time {
                                         state_guard.time = Some(time);
-                                        println!("Updated server time");
                                     }
 
                                     if let Some(info) = response.info {
                                         state_guard.info = Some(info);
-                                        println!("Updated server info");
                                     }
 
                                     if let Some(map) = response.map {
                                         let monument_count = map.monuments.len();
                                         state_guard.map = Some(map);
-                                        println!("Updated map data ({} monuments)", monument_count);
+                                        println!("Map data loaded ({} monuments)", monument_count);
                                     }
 
                                     if let Some(markers) = response.map_markers {
-                                        println!("Received map markers response");
-
                                         // Check if this was from our test command
                                         let request_info = {
                                             let last_seq = last_markers_request_seq.read().await;
@@ -734,26 +710,32 @@ async fn run_rustplus_connection(
                                                 result
                                             };
 
-                                            // Send response to team chat
-                                            seq_counter += 1;
-                                            let send_request = AppRequest {
-                                                seq: seq_counter,
-                                                player_id,
-                                                player_token,
-                                                entity_id: 0,
-                                                send_team_message: Some(AppSendMessage {
-                                                    message: result.clone(),
-                                                }),
-                                                ..Default::default()
-                                            };
+                                            // For debug commands, only print to terminal
+                                            if is_debug || (!is_show_events && !is_debug) {
+                                                // !debugmarkers or !getmarkers - terminal only
+                                                println!("[Debug Output]\n{}", result);
+                                            } else {
+                                                // !showevents - send to team chat
+                                                seq_counter += 1;
+                                                let send_request = AppRequest {
+                                                    seq: seq_counter,
+                                                    player_id,
+                                                    player_token,
+                                                    entity_id: 0,
+                                                    send_team_message: Some(AppSendMessage {
+                                                        message: result.clone(),
+                                                    }),
+                                                    ..Default::default()
+                                                };
 
-                                            let mut buf = Vec::new();
-                                            if send_request.encode(&mut buf).is_ok() {
-                                                let mut write_guard = write.lock().await;
-                                                if let Err(e) = write_guard.send(Message::Binary(buf)).await {
-                                                    eprintln!("Failed to send: {}", e);
-                                                } else {
-                                                    println!("[Sent] {}", result);
+                                                let mut buf = Vec::new();
+                                                if send_request.encode(&mut buf).is_ok() {
+                                                    let mut write_guard = write.lock().await;
+                                                    if let Err(e) = write_guard.send(Message::Binary(buf)).await {
+                                                        eprintln!("Failed to send: {}", e);
+                                                    } else {
+                                                        println!("[Sent to team chat]");
+                                                    }
                                                 }
                                             }
 
@@ -766,19 +748,15 @@ async fn run_rustplus_connection(
                                     }
 
                                     if let Some(error) = response.error {
-                                        eprintln!("API Error: {}", error.error);
-
                                         if error.error.contains("not paired") ||
                                            error.error.contains("auth") ||
                                            error.error.contains("token") ||
                                            error.error.contains("unauthorized") {
-                                            eprintln!("\n! Token appears to be invalid or expired");
-                                            eprintln!("! To re-pair this server:");
-                                            eprintln!("!   1. Run: node capture_pairing.js");
-                                            eprintln!("!   2. In-game: ESC -> Rust+ -> Pair with Server");
-                                            eprintln!("!   3. Restart RustServant");
-                                            eprintln!("\nShutting down due to authentication failure...");
-                                            return false;
+                                            eprintln!("\nAuthentication Error: Token invalid or expired");
+                                            eprintln!("Use Discord command /pair to re-pair with this server\n");
+                                            return ReconnectAction::Stop;
+                                        } else {
+                                            eprintln!("API Error: {}", error.error);
                                         }
                                     }
                                 }
@@ -816,8 +794,6 @@ async fn run_rustplus_connection(
                                                         let mut write_guard = write.lock().await;
                                                         if let Err(e) = write_guard.send(Message::Binary(buf)).await {
                                                             eprintln!("Failed to send markers request: {}", e);
-                                                        } else {
-                                                            println!("[Sent] getMapMarkers request (seq: {})", markers_seq);
                                                         }
                                                     }
                                                     continue; // Skip normal response handling
@@ -826,10 +802,12 @@ async fn run_rustplus_connection(
                                                 let state_guard = state.read().await;
 
                                                 let response_text = match command.as_str() {
+                                                    "!help" => Some("Commands: !time, !night, !day, !pop, !info, !showevents".to_string()),
                                                     "!time" => state_guard.get_current_time_info(),
+                                                    "!pop" => state_guard.get_population_info(),
+                                                    "!info" => state_guard.get_server_info(),
                                                     "!night" => state_guard.calculate_time_until_night(),
                                                     "!day" => state_guard.calculate_time_until_day(),
-                                                    "!info" => state_guard.get_server_info(),
                                                     "!mapdebug" => {
                                                         if let (Some(map), Some(info)) = (&state_guard.map, &state_guard.info) {
                                                             Some(format!(
@@ -880,31 +858,41 @@ async fn run_rustplus_connection(
                                                             Some("Map data not loaded yet".to_string())
                                                         }
                                                     },
-                                                    _ => Some(format!("Unknown command. Try: !time, !night, !day, !info, !showevents")),
+                                                    _ => Some("Unknown command. Type !help for available commands".to_string()),
                                                 };
 
                                                 drop(state_guard);
 
                                                 if let Some(response) = response_text {
-                                                    seq_counter += 1;
-                                                    let send_request = AppRequest {
-                                                        seq: seq_counter,
-                                                        player_id,
-                                                        player_token,
-                                                        entity_id: 0,
-                                                        send_team_message: Some(AppSendMessage {
-                                                            message: response.clone(),
-                                                        }),
-                                                        ..Default::default()
-                                                    };
+                                                    // Check if this is a debug command
+                                                    let is_debug_command = command.as_str() == "!mapdebug" ||
+                                                                          command.as_str() == "!testmonuments";
 
-                                                    let mut buf = Vec::new();
-                                                    if send_request.encode(&mut buf).is_ok() {
-                                                        let mut write_guard = write.lock().await;
-                                                        if let Err(e) = write_guard.send(Message::Binary(buf)).await {
-                                                            eprintln!("Failed to send: {}", e);
-                                                        } else {
-                                                            println!("[Sent] {}", response);
+                                                    if is_debug_command {
+                                                        // Debug commands - terminal only
+                                                        println!("[Debug Output]\n{}", response);
+                                                    } else {
+                                                        // Normal commands - send to team chat
+                                                        seq_counter += 1;
+                                                        let send_request = AppRequest {
+                                                            seq: seq_counter,
+                                                            player_id,
+                                                            player_token,
+                                                            entity_id: 0,
+                                                            send_team_message: Some(AppSendMessage {
+                                                                message: response.clone(),
+                                                            }),
+                                                            ..Default::default()
+                                                        };
+
+                                                        let mut buf = Vec::new();
+                                                        if send_request.encode(&mut buf).is_ok() {
+                                                            let mut write_guard = write.lock().await;
+                                                            if let Err(e) = write_guard.send(Message::Binary(buf)).await {
+                                                                eprintln!("Failed to send: {}", e);
+                                                            } else {
+                                                                println!("[Sent to team chat]");
+                                                            }
                                                         }
                                                     }
                                                 }
@@ -919,12 +907,12 @@ async fn run_rustplus_connection(
                         }
                     }
                     Ok(Message::Close(_)) => {
-                        println!("Connection closed");
-                        return false;
+                        println!("Connection closed by server");
+                        return ReconnectAction::Retry;
                     }
                     Err(e) => {
-                        eprintln!("Error: {}", e);
-                        return false;
+                        eprintln!("Connection error: {}", e);
+                        return ReconnectAction::Retry;
                     }
                     _ => {}
                 }
@@ -933,16 +921,8 @@ async fn run_rustplus_connection(
             }
         }
         Err(e) => {
-            eprintln!("Failed to connect: {}", e);
-            eprintln!("\nMake sure:");
-            eprintln!("  1. The Rust server is running");
-            eprintln!("  2. Rust+ is enabled on the server");
-            eprintln!("  3. You're paired with the correct server");
-            eprintln!("  4. Your pairing hasn't expired");
-            eprintln!("\nTo re-pair:");
-            eprintln!("  1. Run: node capture_pairing.js");
-            eprintln!("  2. In-game: ESC -> Rust+ -> Pair with Server");
-            return false;
+            eprintln!("Connection failed: {}", e);
+            return ReconnectAction::Retry;
         }
     }
 }

@@ -3,12 +3,14 @@
 /**
  * Rust+ Pairing Capture Script
  *
- * This script listens for Rust+ pairing notifications and automatically
- * saves the server credentials to server_config.json
- *
- * Usage: node capture_pairing.js
+ * Usage: node capture_pairing.js [--timeout=60]
  *
  * Then in Rust game: ESC -> Rust+ -> Pair with Server
+ *
+ * Exit codes:
+ *   0 = Success (server paired)
+ *   1 = Error
+ *   124 = Timeout
  */
 
 const { spawn } = require('child_process');
@@ -16,6 +18,61 @@ const fs = require('fs');
 const path = require('path');
 
 const CONFIG_FILE = path.join(__dirname, 'servers.json');
+const HISTORY_FILE = path.join(__dirname, '.pairing_history.json');
+
+// Parse command line arguments
+const args = process.argv.slice(2);
+let timeout = null;
+
+for (const arg of args) {
+    if (arg.startsWith('--timeout=')) {
+        timeout = parseInt(arg.split('=')[1], 10);
+        if (isNaN(timeout) || timeout <= 0) {
+            console.error('ERROR: Invalid timeout value');
+            process.exit(1);
+        }
+    }
+}
+
+// Load and clean pairing history
+function loadPairingHistory() {
+    if (!fs.existsSync(HISTORY_FILE)) {
+        return new Set();
+    }
+
+    try {
+        const data = JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8'));
+        const oneHourAgo = Date.now() - (60 * 60 * 1000);
+
+        // Clean old entries (older than 1 hour)
+        const cleaned = Object.entries(data)
+            .filter(([_, timestamp]) => timestamp > oneHourAgo)
+            .reduce((acc, [id, timestamp]) => {
+                acc[id] = timestamp;
+                return acc;
+            }, {});
+
+        // Save cleaned data back
+        fs.writeFileSync(HISTORY_FILE, JSON.stringify(cleaned));
+
+        return new Set(Object.keys(cleaned));
+    } catch (e) {
+        return new Set();
+    }
+}
+
+function savePairingHistory(processedIds) {
+    try {
+        const data = {};
+        const now = Date.now();
+        processedIds.forEach(id => {
+            data[id] = now;
+        });
+        fs.writeFileSync(HISTORY_FILE, JSON.stringify(data));
+    } catch (e) {
+        // Silent fail
+    }
+}
 
 function generateServerId(serverName) {
     return serverName
@@ -48,7 +105,17 @@ function saveServers(config) {
     }
 }
 
-console.log('[Pairing] Listening for server pairing notifications...\n');
+console.log('PAIRING_LISTENING');
+
+// Set up timeout if specified
+let timeoutHandle = null;
+if (timeout) {
+    timeoutHandle = setTimeout(() => {
+        console.log('PAIRING_TIMEOUT');
+        fcmListen.kill();
+        process.exit(124);
+    }, timeout * 1000);
+}
 
 // Run fcm-listen and capture output
 const fcmListen = spawn('npx', ['@liamcottle/rustplus.js', 'fcm-listen'], {
@@ -59,7 +126,7 @@ let buffer = '';
 let inObject = false;
 let objectDepth = 0;
 let currentObject = '';
-let processedNotifications = new Set(); // Track processed notification IDs
+let processedNotifications = loadPairingHistory(); // Load previously processed notification IDs
 
 fcmListen.stdout.on('data', (data) => {
     const output = data.toString();
@@ -95,6 +162,7 @@ fcmListen.stdout.on('data', (data) => {
                             shouldProcess = false;
                         } else {
                             processedNotifications.add(notificationId);
+                            savePairingHistory(processedNotifications);
                         }
                     }
 
@@ -111,7 +179,25 @@ fcmListen.stdout.on('data', (data) => {
                         if (serverInfo.type === 'server' && serverInfo.ip && serverInfo.port &&
                             serverInfo.playerId && serverInfo.playerToken) {
 
-                            console.log('[Pairing] New server pairing detected!');
+                            // Extract timestamp from the notification (FCM includes this)
+                            const timestampMatch = currentObject.match(/key:\s*['"]google.sent_time['"]\s*,\s*value:\s*['"](\d+)['"]/);
+                            let isRecentNotification = true;
+
+                            if (timestampMatch && timestampMatch[1]) {
+                                const notificationTime = parseInt(timestampMatch[1], 10);
+                                const currentTime = Date.now();
+                                const ageMinutes = (currentTime - notificationTime) / 1000 / 60;
+
+                                // Ignore notifications older than 2 minutes (likely FCM retries from old pairing)
+                                if (ageMinutes > 2) {
+                                    isRecentNotification = false;
+                                }
+                            }
+
+                            if (!isRecentNotification) {
+                                // Skip old lingering FCM notification
+                            } else {
+
                             const serverId = generateServerId(serverInfo.name);
                             const serverConfig = {
                                 name: serverInfo.name,
@@ -123,36 +209,35 @@ fcmListen.stdout.on('data', (data) => {
 
                             const serversData = loadServers();
                             const isNewServer = !serversData.servers[serverId];
+                            const isFirstServer = Object.keys(serversData.servers).length === 0;
 
                             serversData.servers[serverId] = serverConfig;
 
-                            if (serversData.active_server === null || isNewServer) {
+                            // Only set as active if it's the very first server
+                            if (isFirstServer) {
                                 serversData.active_server = serverId;
                             }
 
                             saveServers(serversData);
 
-                            console.log('\n' + (isNewServer ? 'Added new server!' : 'Updated existing server!'));
-                            console.log(`Saved to: ${CONFIG_FILE}`);
-                            console.log('\nServer Configuration:');
-                            console.log(`  Server ID:    ${serverId}`);
-                            console.log(`  Server Name:  ${serverConfig.name}`);
-                            console.log(`  IP:           ${serverConfig.server_ip}`);
-                            console.log(`  Port:         ${serverConfig.server_port}`);
-                            console.log(`  Player ID:    ${serverConfig.player_id}`);
-                            console.log(`  Player Token: ${serverConfig.player_token.substring(0, 5)}...`);
+                            // Output machine-readable success message
+                            console.log('PAIRING_SUCCESS');
+                            console.log(`SERVER_ID:${serverId}`);
+                            console.log(`SERVER_NAME:${serverConfig.name}`);
+                            console.log(`SERVER_ADDRESS:${serverConfig.server_ip}:${serverConfig.server_port}`);
+                            console.log(`IS_NEW:${isNewServer}`);
 
-                            if (serversData.active_server === serverId) {
-                                console.log('\n  [ACTIVE SERVER]');
+                            // Clear timeout and exit successfully
+                            if (timeoutHandle) {
+                                clearTimeout(timeoutHandle);
                             }
-
-                            console.log('\nTotal servers: ' + Object.keys(serversData.servers).length);
-                            console.log('You can now run: cargo run');
-                            console.log('\nPress Ctrl+C to exit, or leave running to capture more servers.\n');
+                            fcmListen.kill();
+                            process.exit(0);
+                            }
                         }
                     }
                 } catch (e) {
-                    console.error('[Pairing] Failed to parse notification:', e.message);
+                    // Silent fail for parse errors
                 }
                 currentObject = '';
             }
@@ -163,16 +248,23 @@ fcmListen.stdout.on('data', (data) => {
 });
 
 fcmListen.on('close', (code) => {
-    if (code !== 0) {
-        console.error(`\nfcm-listen process exited with code ${code}`);
-        console.error('Make sure you have run: npx @liamcottle/rustplus.js fcm-register');
+    if (timeoutHandle) {
+        clearTimeout(timeoutHandle);
     }
-    process.exit(code);
+
+    if (code !== 0 && code !== null) {
+        console.log('PAIRING_ERROR:FCM_LISTEN_FAILED');
+        console.error('Make sure you have run: npx @liamcottle/rustplus.js fcm-register');
+        process.exit(1);
+    }
 });
 
 // Handle Ctrl+C gracefully
 process.on('SIGINT', () => {
-    console.log('\n\nShutting down...');
+    if (timeoutHandle) {
+        clearTimeout(timeoutHandle);
+    }
+    console.log('PAIRING_CANCELLED');
     fcmListen.kill();
-    process.exit(0);
+    process.exit(130);
 });
